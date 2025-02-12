@@ -1,0 +1,541 @@
+#!/usr/bin/env python3
+import json
+import logging
+import os
+import base58
+import requests
+import base64
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import (
+    Updater,
+    CommandHandler,
+    MessageHandler,
+    Filters,
+    ConversationHandler,
+    CallbackContext,
+    CallbackQueryHandler,
+)
+from solana.rpc.api import Client
+from solana.publickey import PublicKey
+from solana.transaction import Transaction, TransactionInstruction
+from solana.system_program import transfer, TransferParams
+from cryptography.fernet import Fernet
+import nacl.signing
+import nacl.encoding
+
+# -------------------------------------------------------------------
+# Custom Keypair Implementation (legacy-style keypair.py)
+# -------------------------------------------------------------------
+class Keypair:
+    def __init__(self, signing_key: nacl.signing.SigningKey):
+        self._signing_key = signing_key
+        self._verify_key = signing_key.verify_key
+
+    @classmethod
+    def generate(cls):
+        """Generate a new keypair with a freshly generated signing key."""
+        return cls(nacl.signing.SigningKey.generate())
+
+    @classmethod
+    def from_secret_key(cls, secret_key: bytes):
+        """Create a Keypair instance from a given secret key (as bytes)."""
+        signing_key = nacl.signing.SigningKey(secret_key)
+        return cls(signing_key)
+
+    @property
+    def public_key(self) -> str:
+        """Return the public key as a Base58-encoded string."""
+        return base58.b58encode(self._verify_key.encode()).decode('utf-8')
+
+    def sign(self, message: bytes) -> bytes:
+        """Sign a given message (bytes) with the private key; return the signature."""
+        signed = self._signing_key.sign(message)
+        return signed.signature
+
+    def __bytes__(self) -> bytes:
+        """Return the private key as bytes."""
+        return self._signing_key.encode()
+
+    def __repr__(self):
+        return f"<Keypair public_key={self.public_key}>"
+
+# -------------------------------------------------------------------
+# Secure Key Management
+# -------------------------------------------------------------------
+# In production, set ENCRYPTION_KEY in your environment securely.
+ENCRYPTION_KEY = os.environ.get('ENCRYPTION_KEY')
+if not ENCRYPTION_KEY:
+    # For demonstration only – in production DO NOT generate a temporary key.
+    ENCRYPTION_KEY = Fernet.generate_key()
+    print("WARNING: Using a temporary encryption key. Set ENCRYPTION_KEY env var in production.")
+fernet = Fernet(ENCRYPTION_KEY)
+
+def encrypt_private_key(key_str: str) -> bytes:
+    return fernet.encrypt(key_str.encode())
+
+def decrypt_private_key(encrypted_key: bytes) -> str:
+    return fernet.decrypt(encrypted_key).decode()
+
+def get_keypair_from_encrypted(encrypted_key: bytes) -> Keypair:
+    """
+    Decrypts the stored key string and returns a Keypair.
+    The private key should be provided either as a JSON array (e.g. "[12,34,...]")
+    or as a whitespace-separated string of integers.
+    """
+    plain = decrypt_private_key(encrypted_key).strip()
+    if plain.startswith('['):
+        secret_key = json.loads(plain)
+    else:
+        secret_key = [int(x) for x in plain.split()]
+    return Keypair.from_secret_key(bytes(secret_key))
+
+# -------------------------------------------------------------------
+# Global Variables and Solana Client Setup
+# -------------------------------------------------------------------
+main_wallet = None   # Dict: { "encrypted_key": bytes, "public_key": str }
+bundled_wallets = [] # List of dicts: each { "name": str, "encrypted_key": bytes, "public_key": str }
+token_contract = None  # Token contract address for swap operations
+
+# Use Solana Devnet for testing; update endpoint as needed.
+solana_client = Client("https://api.devnet.solana.com")
+
+# -------------------------------------------------------------------
+# Logging Configuration
+# -------------------------------------------------------------------
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# -------------------------------------------------------------------
+# Conversation States
+# -------------------------------------------------------------------
+BUNDLE_KEY, BUNDLE_NAME = range(2)
+BUY_ADDRESS = 0         # For /buy conversation
+WITHDRAW_ADDRESS = 0    # For /withdraw conversation
+
+# -------------------------------------------------------------------
+# Real Swap Logic Using Jupiter Aggregator REST API
+# -------------------------------------------------------------------
+def swap_sol_for_token(wallet: dict, token_contract: str) -> Transaction:
+    """
+    Swaps all SOL in the wallet for the specified token using Jupiter Aggregator.
+    This function:
+      1. Retrieves the SOL balance from the wallet.
+      2. Calls Jupiter’s quote API to compute swap routes.
+      3. Calls Jupiter’s swap API to get a serialized transaction.
+      4. Deserializes and returns the Transaction.
+    Note: Adjust slippage and cluster parameters as needed.
+    """
+    wallet_pubkey = PublicKey(wallet["public_key"])
+    balance_response = solana_client.get_balance(wallet_pubkey)
+    if "result" not in balance_response or "value" not in balance_response["result"]:
+        raise Exception("Unable to fetch wallet balance")
+    balance = balance_response["result"]["value"]
+    if balance <= 0:
+        raise Exception("No SOL to swap")
+    amount_str = str(balance)
+    SOL_MINT = "So11111111111111111111111111111111111111112"
+    
+    # Get quote from Jupiter Aggregator
+    quote_url = "https://quote-api.jup.ag/v1/quote"
+    params = {
+        "inputMint": SOL_MINT,
+        "outputMint": token_contract,
+        "amount": amount_str,
+        "slippage": "0.5",
+        "cluster": "devnet"
+    }
+    r = requests.get(quote_url, params=params)
+    if r.status_code != 200:
+        raise Exception("Failed to get quote from Jupiter")
+    data = r.json()
+    if not data.get("data") or len(data["data"]) == 0:
+        raise Exception("No swap routes found")
+    route = data["data"][0]
+    
+    # Request swap transaction from Jupiter
+    swap_url = "https://quote-api.jup.ag/v1/swap"
+    payload = {
+        "route": route,
+        "userPublicKey": wallet["public_key"],
+        "wrapUnwrapSOL": True  # Required if swapping SOL
+    }
+    headers = {"Content-Type": "application/json"}
+    r2 = requests.post(swap_url, json=payload, headers=headers)
+    if r2.status_code != 200:
+        raise Exception("Failed to get swap transaction from Jupiter")
+    swap_data = r2.json()
+    if "swapTransaction" not in swap_data:
+        raise Exception("No swap transaction returned")
+    swap_tx_base64 = swap_data["swapTransaction"]
+    tx_bytes = base64.b64decode(swap_tx_base64)
+    tx = Transaction.deserialize(tx_bytes)
+    return tx
+
+def swap_token_for_sol(wallet: dict, token_contract: str) -> Transaction:
+    """
+    Swaps tokens for SOL using Jupiter Aggregator.
+    This function assumes a fixed token amount for demonstration.
+    In production, you would query the wallet’s token account for its balance.
+    """
+    # For demonstration, assume a token amount (in smallest units). Replace with actual balance.
+    amount = 1000000  
+    amount_str = str(amount)
+    SOL_MINT = "So11111111111111111111111111111111111111112"
+    
+    # Get quote from Jupiter Aggregator
+    quote_url = "https://quote-api.jup.ag/v1/quote"
+    params = {
+        "inputMint": token_contract,
+        "outputMint": SOL_MINT,
+        "amount": amount_str,
+        "slippage": "0.5",
+        "cluster": "devnet"
+    }
+    r = requests.get(quote_url, params=params)
+    if r.status_code != 200:
+        raise Exception("Failed to get quote from Jupiter")
+    data = r.json()
+    if not data.get("data") or len(data["data"]) == 0:
+        raise Exception("No swap routes found")
+    route = data["data"][0]
+    
+    # Request swap transaction from Jupiter
+    swap_url = "https://quote-api.jup.ag/v1/swap"
+    payload = {
+        "route": route,
+        "userPublicKey": wallet["public_key"]
+    }
+    headers = {"Content-Type": "application/json"}
+    r2 = requests.post(swap_url, json=payload, headers=headers)
+    if r2.status_code != 200:
+        raise Exception("Failed to get swap transaction from Jupiter")
+    swap_data = r2.json()
+    if "swapTransaction" not in swap_data:
+        raise Exception("No swap transaction returned")
+    swap_tx_base64 = swap_data["swapTransaction"]
+    tx_bytes = base64.b64decode(swap_tx_base64)
+    tx = Transaction.deserialize(tx_bytes)
+    return tx
+
+# -------------------------------------------------------------------
+# Bot Command Handlers
+# -------------------------------------------------------------------
+def start(update: Update, context: CallbackContext):
+    """
+    /start command to set the main wallet.
+    Usage: /start <your_main_wallet_private_key>
+    The provided key is immediately encrypted.
+    """
+    global main_wallet
+    if context.args:
+        key_str = " ".join(context.args)
+        try:
+            encrypted_key = encrypt_private_key(key_str)
+            kp = get_keypair_from_encrypted(encrypted_key)
+            main_wallet = {"encrypted_key": encrypted_key, "public_key": str(kp.public_key)}
+            update.message.reply_text(f"Main wallet set successfully!\nPublic key: {main_wallet['public_key']}")
+        except Exception as e:
+            update.message.reply_text(f"Error setting main wallet: {e}")
+            logger.exception("Error in /start")
+    else:
+        update.message.reply_text("Usage: /start <your_main_wallet_private_key>")
+
+def bundle_start(update: Update, context: CallbackContext):
+    """
+    /bundle command starts a conversation to securely store 20 wallet keys with custom names.
+    """
+    global bundled_wallets
+    bundled_wallets = []
+    context.user_data["wallet_count"] = 1
+    update.message.reply_text("Enter the private key for wallet 1:")
+    return BUNDLE_KEY
+
+def bundle_receive_key(update: Update, context: CallbackContext):
+    """
+    Receives a wallet's private key, encrypts it, and asks for a custom wallet name.
+    """
+    wallet_num = context.user_data.get("wallet_count", 1)
+    key_str = update.message.text
+    try:
+        encrypted_key = encrypt_private_key(key_str)
+        kp = get_keypair_from_encrypted(encrypted_key)
+        context.user_data["temp_wallet"] = {"encrypted_key": encrypted_key, "public_key": str(kp.public_key)}
+        update.message.reply_text(f"Private key for wallet {wallet_num} received. Please enter a name for wallet {wallet_num}:")
+        return BUNDLE_NAME
+    except Exception as e:
+        update.message.reply_text(f"Error processing wallet {wallet_num} key: {e}\nRe-enter the private key:")
+        logger.exception("Error in bundle_receive_key")
+        return BUNDLE_KEY
+
+def bundle_receive_name(update: Update, context: CallbackContext):
+    """
+    Receives the wallet name, stores the wallet data securely, and prompts for the next wallet.
+    """
+    wallet_num = context.user_data.get("wallet_count", 1)
+    name = update.message.text.strip() or f"wallet{wallet_num}"
+    temp_wallet = context.user_data.get("temp_wallet")
+    temp_wallet["name"] = name
+    bundled_wallets.append(temp_wallet)
+    if wallet_num < 20:
+        context.user_data["wallet_count"] = wallet_num + 1
+        update.message.reply_text(f"Wallet {wallet_num} named '{name}' saved. Enter the private key for wallet {wallet_num + 1}:")
+        return BUNDLE_KEY
+    else:
+        update.message.reply_text("All 20 wallets have been bundled successfully!")
+        return ConversationHandler.END
+
+def bundle_cancel(update: Update, context: CallbackContext):
+    update.message.reply_text("Bundling process canceled.")
+    return ConversationHandler.END
+
+def distribute(update: Update, context: CallbackContext):
+    """
+    /distribute command divides the main wallet's balance evenly among the 20 bundled wallets.
+    Enhanced error handling and transaction confirmation are included.
+    """
+    global main_wallet, bundled_wallets, solana_client
+    if not main_wallet:
+        update.message.reply_text("Main wallet is not set. Use /start first.")
+        return
+    if len(bundled_wallets) != 20:
+        update.message.reply_text("You must bundle exactly 20 wallets first using /bundle.")
+        return
+
+    try:
+        main_pubkey = PublicKey(main_wallet["public_key"])
+        balance_response = solana_client.get_balance(main_pubkey)
+        if "result" not in balance_response or "value" not in balance_response["result"]:
+            update.message.reply_text("Error retrieving main wallet balance.")
+            return
+
+        balance = balance_response["result"]["value"]
+        if balance == 0:
+            update.message.reply_text("Main wallet has zero balance.")
+            return
+
+        amount_per_wallet = balance // len(bundled_wallets)
+        if amount_per_wallet == 0:
+            update.message.reply_text("Insufficient funds to distribute evenly.")
+            return
+
+        for wallet in bundled_wallets:
+            tx = Transaction()
+            tx.add(transfer(
+                TransferParams(
+                    from_pubkey=main_pubkey,
+                    to_pubkey=PublicKey(wallet["public_key"]),
+                    lamports=amount_per_wallet,
+                )
+            ))
+            try:
+                sig = solana_client.send_transaction(tx, get_keypair_from_encrypted(main_wallet["encrypted_key"]))
+                confirmation = solana_client.confirm_transaction(sig)
+                if not confirmation.get("result"):
+                    logger.error(f"Transaction not confirmed for wallet {wallet['name']}")
+            except Exception as tx_e:
+                logger.exception(f"Error sending transaction for wallet {wallet['name']}")
+        update.message.reply_text("Funds have been distributed evenly among the 20 wallets.")
+    except Exception as e:
+        update.message.reply_text(f"Error during distribution: {e}")
+        logger.exception("Error in /distribute")
+
+def buy_start(update: Update, context: CallbackContext):
+    update.message.reply_text("Please enter the token contract (mint) address to buy:")
+    return BUY_ADDRESS
+
+def buy_receive_address(update: Update, context: CallbackContext):
+    global token_contract
+    token_contract = update.message.text.strip()
+    context.user_data["buy_token_contract"] = token_contract
+    keyboard = [[InlineKeyboardButton("Confirm Buy", callback_data="buy_confirm")]]
+    update.message.reply_text(
+        f"Token contract address set to: {token_contract}.\nClick the button to confirm buying tokens with all 20 wallets.",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return ConversationHandler.END
+
+def buy_cancel(update: Update, context: CallbackContext):
+    update.message.reply_text("Buy process canceled.")
+    return ConversationHandler.END
+
+def buy_confirm_callback(update: Update, context: CallbackContext):
+    query = update.callback_query
+    query.answer()
+    global bundled_wallets, token_contract, solana_client
+    if not token_contract:
+        query.edit_message_text("Token contract is not set.")
+        return
+    if len(bundled_wallets) != 20:
+        query.edit_message_text("You must bundle 20 wallets first using /bundle.")
+        return
+    errors = []
+    for wallet in bundled_wallets:
+        try:
+            keypair = get_keypair_from_encrypted(wallet["encrypted_key"])
+            # Swap all SOL in the wallet for the specified token via Jupiter
+            tx = swap_sol_for_token(wallet, token_contract)
+            sig = solana_client.send_transaction(tx, keypair)
+            confirmation = solana_client.confirm_transaction(sig)
+            if not confirmation.get("result"):
+                errors.append(f"{wallet['name']}: Transaction not confirmed")
+        except Exception as e:
+            errors.append(f"{wallet['name']}: {e}")
+            logger.exception(f"Error in buy for wallet {wallet['name']}")
+    if errors:
+        query.edit_message_text("Buy executed with errors:\n" + "\n".join(errors))
+    else:
+        query.edit_message_text(f"Buy transactions executed on token contract: {token_contract}")
+
+def sell_command(update: Update, context: CallbackContext):
+    global token_contract, bundled_wallets
+    if not token_contract:
+        update.message.reply_text("Token contract is not set. Use /buy first to specify the token contract.")
+        return
+    if len(bundled_wallets) != 20:
+        update.message.reply_text("You must bundle 20 wallets first using /bundle.")
+        return
+    keyboard = [[InlineKeyboardButton("Confirm Sell", callback_data="sell_confirm")]]
+    update.message.reply_text("Click the button below to swap all tokens for SOL.", reply_markup=InlineKeyboardMarkup(keyboard))
+
+def sell_confirm_callback(update: Update, context: CallbackContext):
+    query = update.callback_query
+    query.answer()
+    global bundled_wallets, token_contract, solana_client
+    if not token_contract:
+        query.edit_message_text("Token contract is not set.")
+        return
+    if len(bundled_wallets) != 20:
+        query.edit_message_text("You must bundle 20 wallets first using /bundle.")
+        return
+    errors = []
+    for wallet in bundled_wallets:
+        try:
+            keypair = get_keypair_from_encrypted(wallet["encrypted_key"])
+            # Swap tokens for SOL via Jupiter – note: this demo uses a fixed token amount.
+            tx = swap_token_for_sol(wallet, token_contract)
+            sig = solana_client.send_transaction(tx, keypair)
+            confirmation = solana_client.confirm_transaction(sig)
+            if not confirmation.get("result"):
+                errors.append(f"{wallet['name']}: Transaction not confirmed")
+        except Exception as e:
+            errors.append(f"{wallet['name']}: {e}")
+            logger.exception(f"Error in sell for wallet {wallet['name']}")
+    if errors:
+        query.edit_message_text("Sell executed with errors:\n" + "\n".join(errors))
+    else:
+        query.edit_message_text(f"Sell transactions executed on token contract: {token_contract}")
+
+def withdraw_start(update: Update, context: CallbackContext):
+    update.message.reply_text("Please enter the receiving Solana address:")
+    return WITHDRAW_ADDRESS
+
+def withdraw_receive_address(update: Update, context: CallbackContext):
+    receive_address = update.message.text.strip()
+    context.user_data["withdraw_address"] = receive_address
+    keyboard = [[InlineKeyboardButton("Confirm Withdraw", callback_data="withdraw_confirm")]]
+    update.message.reply_text(
+        f"Receiving address set to: {receive_address}.\nClick the button to confirm withdrawal of all SOL from all wallets.",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return ConversationHandler.END
+
+def withdraw_cancel(update: Update, context: CallbackContext):
+    update.message.reply_text("Withdrawal process canceled.")
+    return ConversationHandler.END
+
+def withdraw_confirm_callback(update: Update, context: CallbackContext):
+    query = update.callback_query
+    query.answer()
+    global bundled_wallets, solana_client
+    if len(bundled_wallets) != 20:
+        query.edit_message_text("You must bundle 20 wallets first using /bundle.")
+        return
+    withdraw_address = context.user_data.get("withdraw_address")
+    if not withdraw_address:
+        query.edit_message_text("No receiving address provided.")
+        return
+    errors = []
+    for wallet in bundled_wallets:
+        try:
+            keypair = get_keypair_from_encrypted(wallet["encrypted_key"])
+            wallet_pubkey = PublicKey(wallet["public_key"])
+            balance_response = solana_client.get_balance(wallet_pubkey)
+            if "result" not in balance_response or "value" not in balance_response["result"]:
+                errors.append(f"{wallet['name']}: Could not fetch balance")
+                continue
+            balance = balance_response["result"]["value"]
+            if balance <= 0:
+                continue
+            tx = Transaction()
+            tx.add(transfer(
+                TransferParams(
+                    from_pubkey=wallet_pubkey,
+                    to_pubkey=PublicKey(withdraw_address),
+                    lamports=balance,
+                )
+            ))
+            sig = solana_client.send_transaction(tx, keypair)
+            confirmation = solana_client.confirm_transaction(sig)
+            if not confirmation.get("result"):
+                errors.append(f"{wallet['name']}: Transaction not confirmed")
+        except Exception as e:
+            errors.append(f"{wallet['name']}: {e}")
+            logger.exception(f"Error in withdrawal for wallet {wallet['name']}")
+    if errors:
+        query.edit_message_text("Withdrawal completed with errors:\n" + "\n".join(errors))
+    else:
+        query.edit_message_text("All wallets have withdrawn all SOL to the receiving address.")
+
+def main():
+    # **********************************************************************
+    # Replace "YOUR_TELEGRAM_BOT_TOKEN" below with your actual Telegram bot token.
+    TELEGRAM_BOT_TOKEN = "123456789:ABCDEF1234567890abcdef1234567890"  # <-- REPLACE THIS WITH YOUR ACTUAL TOKEN
+    # **********************************************************************
+
+    updater = Updater(TELEGRAM_BOT_TOKEN, use_context=True)
+    dp = updater.dispatcher
+
+    # /start command to set the main wallet.
+    dp.add_handler(CommandHandler("start", start))
+
+    # Conversation handler for /bundle.
+    bundle_conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("bundle", bundle_start)],
+        states={
+            BUNDLE_KEY: [MessageHandler(Filters.text & ~Filters.command, bundle_receive_key)],
+            BUNDLE_NAME: [MessageHandler(Filters.text & ~Filters.command, bundle_receive_name)],
+        },
+        fallbacks=[CommandHandler("cancel", bundle_cancel)],
+    )
+    dp.add_handler(bundle_conv_handler)
+
+    # Conversation handler for /buy.
+    buy_conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("buy", buy_start)],
+        states={BUY_ADDRESS: [MessageHandler(Filters.text & ~Filters.command, buy_receive_address)]},
+        fallbacks=[CommandHandler("cancel", buy_cancel)],
+    )
+    dp.add_handler(buy_conv_handler)
+    dp.add_handler(CallbackQueryHandler(buy_confirm_callback, pattern="^buy_confirm$"))
+
+    # /sell command.
+    dp.add_handler(CommandHandler("sell", sell_command))
+    dp.add_handler(CallbackQueryHandler(sell_confirm_callback, pattern="^sell_confirm$"))
+
+    # Conversation handler for /withdraw.
+    withdraw_conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("withdraw", withdraw_start)],
+        states={WITHDRAW_ADDRESS: [MessageHandler(Filters.text & ~Filters.command, withdraw_receive_address)]},
+        fallbacks=[CommandHandler("cancel", withdraw_cancel)],
+    )
+    dp.add_handler(withdraw_conv_handler)
+    dp.add_handler(CallbackQueryHandler(withdraw_confirm_callback, pattern="^withdraw_confirm$"))
+
+    # /distribute command.
+    dp.add_handler(CommandHandler("distribute", distribute))
+
+    updater.start_polling()
+    updater.idle()
+
+if __name__ == '__main__':
+    main()
