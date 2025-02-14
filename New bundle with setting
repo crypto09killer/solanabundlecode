@@ -1,6 +1,3 @@
-Here’s the complete and integrated code for your Telegram bot, including the `/setting` command for configuring slippage and all the existing functionality. This code combines everything you provided and ensures it works seamlessly together:
-
-```python
 #!/usr/bin/env python3
 import json
 import logging
