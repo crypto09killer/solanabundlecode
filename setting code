@@ -1,0 +1,109 @@
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Updater, CommandHandler, CallbackContext, CallbackQueryHandler,
+    MessageHandler, Filters, ConversationHandler
+)
+
+# Global variables for slippage
+buy_slippage = "0.5"  # Default buy slippage
+sell_slippage = "0.5" # Default sell slippage
+
+# Constants for conversation states
+SLIPPAGE_INPUT = 0
+
+# /setting command handler
+def setting_command(update: Update, context: CallbackContext):
+    keyboard = [
+        [InlineKeyboardButton("Buy Slippage", callback_data="buy_slippage")],
+        [InlineKeyboardButton("Sell Slippage", callback_data="sell_slippage")]
+    ]
+    update.message.reply_text(
+        "Choose the slippage you want to configure:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+# Callback handler for slippage selection
+def slippage_callback(update: Update, context: CallbackContext):
+    query = update.callback_query
+    query.answer()
+    if query.data == "buy_slippage":
+        context.user_data["slippage_type"] = "buy"
+        query.edit_message_text("Enter the buy slippage percentage (e.g., 0.5 for 0.5%):")
+    elif query.data == "sell_slippage":
+        context.user_data["slippage_type"] = "sell"
+        query.edit_message_text("Enter the sell slippage percentage (e.g., 0.5 for 0.5%):")
+    return SLIPPAGE_INPUT
+
+# Handler for slippage input
+def slippage_input(update: Update, context: CallbackContext):
+    slippage_value = update.message.text.strip()
+    slippage_type = context.user_data.get("slippage_type")
+    try:
+        # Validate the slippage value
+        slippage_float = float(slippage_value)
+        if slippage_float < 0 or slippage_float > 100:
+            raise ValueError("Slippage must be between 0 and 100.")
+        if slippage_type == "buy":
+            global buy_slippage
+            buy_slippage = slippage_value
+            update.message.reply_text(f"Buy slippage set to {slippage_value}%.")
+        elif slippage_type == "sell":
+            global sell_slippage
+            sell_slippage = slippage_value
+            update.message.reply_text(f"Sell slippage set to {slippage_value}%.")
+    except ValueError as e:
+        update.message.reply_text(f"Invalid slippage value: {e}. Please enter a number between 0 and 100.")
+    return ConversationHandler.END
+
+# Conversation handler for slippage configuration
+slippage_conv_handler = ConversationHandler(
+    entry_points=[CallbackQueryHandler(slippage_callback, pattern="^(buy_slippage|sell_slippage)$")],
+    states={
+        SLIPPAGE_INPUT: [MessageHandler(Filters.text & ~Filters.command, slippage_input)],
+    },
+    fallbacks=[CommandHandler("cancel", lambda u, c: ConversationHandler.END)],
+)
+
+# Example swap functions using configured slippage
+def swap_sol_for_token(wallet: dict, token_contract: str) -> None:
+    global buy_slippage
+    # Use buy_slippage in the Jupiter API call
+    params = {
+        "inputMint": "SOL",  # Replace with actual SOL mint address
+        "outputMint": token_contract,
+        "amount": "100",  # Example amount
+        "slippage": buy_slippage,  # Use configured buy slippage
+        "cluster": "devnet"
+    }
+    print(f"Swapping SOL for token with slippage {buy_slippage}%: {params}")
+
+def swap_token_for_sol(wallet: dict, token_contract: str) -> None:
+    global sell_slippage
+    # Use sell_slippage in the Jupiter API call
+    params = {
+        "inputMint": token_contract,
+        "outputMint": "SOL",  # Replace with actual SOL mint address
+        "amount": "100",  # Example amount
+        "slippage": sell_slippage,  # Use configured sell slippage
+        "cluster": "devnet"
+    }
+    print(f"Swapping token for SOL with slippage {sell_slippage}%: {params}")
+
+# Main function to start the bot
+def main():
+    # Replace "YOUR_TELEGRAM_BOT_TOKEN" with your actual Telegram bot token.
+    TELEGRAM_BOT_TOKEN = "123456789:ABCDEF1234567890abcdef1234567890"  # <-- REPLACE THIS WITH YOUR ACTUAL TOKEN
+
+    updater = Updater(TELEGRAM_BOT_TOKEN, use_context=True)
+    dp = updater.dispatcher
+
+    # Register the /setting command and slippage conversation handler
+    dp.add_handler(CommandHandler("setting", setting_command))
+    dp.add_handler(slippage_conv_handler)
+
+    # Start the bot
+    updater.start_polling()
+    updater.idle()
+
+if __name__ == "__main__":
+    main()
